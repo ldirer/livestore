@@ -33,6 +33,22 @@ export const eventlogTable = State.SQLite.table({
   },
 })
 
+export const metastoreTable = State.SQLite.table({
+  name: 'eventlog_${PERSISTENCE_FORMAT_VERSION}_serveronly',
+  columns: {
+    seqNum: State.SQLite.integer({ primaryKey: true, schema: EventSequenceNumber.GlobalEventSequenceNumber }),
+    parentSeqNum: State.SQLite.integer({ schema: EventSequenceNumber.GlobalEventSequenceNumber }),
+    name: State.SQLite.text({}),
+    args: State.SQLite.text({ schema: Schema.parseJson(Schema.Any), nullable: true }),
+    /** ISO date format. Currently only used for debugging purposes. */
+    createdAt: State.SQLite.text({}),
+    clientId: State.SQLite.text({}),
+    sessionId: State.SQLite.text({}),
+    /** Track which original room this event came from */
+    originalStoreId: State.SQLite.text({}),
+  },
+})
+
 const WebSocketAttachmentSchema = Schema.parseJson(
   Schema.Struct({
     storeId: Schema.String,
@@ -66,10 +82,58 @@ export const makeDurableObject: MakeDurableObjectClass = (options) => {
 
     private currentHead: EventSequenceNumber.GlobalEventSequenceNumber | 'uninitialized' = 'uninitialized'
 
-    fetch = async (request: Request) =>
-      Effect.sync(() => {
+    fetch = async (request: Request) => {
+      const self = this
+      return Effect.gen(function* () {
+        const url = new URL(request.url)
+
+        // Handle /hack request path
+        if (url.pathname === '/hack') {
+          const metastoreDbName = `eventlog_${PERSISTENCE_FORMAT_VERSION}_serveronly`
+          const connectedClients = self.ctx.getWebSockets()
+
+          // Return early if no clients are connected
+          if (connectedClients.length === 0) {
+            return new Response('No connected clients', { status: 200 })
+          }
+
+          // Get the latest event from metastore
+          const sql = `SELECT *
+                       FROM ${metastoreDbName}
+                       ORDER BY seqNum DESC
+                       LIMIT 1`
+
+          const result = yield* Effect.tryPromise(() => self.env.DB.prepare(sql).all())
+          const rawEvents = result.results
+          const batch = Schema.decodeUnknownSync(Schema.Array(metastoreTable.rowSchema))(rawEvents).map(
+            ({ createdAt, ...eventEncoded }) => ({
+              eventEncoded,
+              metadata: Option.some({ createdAt }),
+            }),
+          )
+
+          if (batch.length === 0) {
+            return new Response('No events in metastore', { status: 200 })
+          }
+
+          const pullRes = WSMessage.PullRes.make({
+            batch,
+            remaining: 0,
+            requestId: { context: 'push', requestId: 'hack' },
+          })
+          const pullResEnc = encodeOutgoingMessage(pullRes)
+
+          // Send to all connected clients
+          for (const conn of connectedClients) {
+            console.log('[HACK] SENDING TO CONNECTED SERVER CLIENTS')
+            conn.send(pullResEnc)
+          }
+
+          return new Response('OK', { status: 200 })
+        }
+
         const storeId = getStoreId(request)
-        const storage = makeStorage(this.ctx, this.env, storeId)
+        const storage = makeStorage(self.ctx, self.env, storeId)
 
         const { 0: client, 1: server } = new WebSocketPair()
 
@@ -78,9 +142,9 @@ export const makeDurableObject: MakeDurableObjectClass = (options) => {
 
         // See https://developers.cloudflare.com/durable-objects/examples/websocket-hibernation-server
 
-        this.ctx.acceptWebSocket(server)
+        self.ctx.acceptWebSocket(server)
 
-        this.ctx.setWebSocketAutoResponse(
+        self.ctx.setWebSocketAutoResponse(
           new WebSocketRequestResponsePair(
             encodeIncomingMessage(WSMessage.Ping.make({ requestId: 'ping' })),
             encodeOutgoingMessage(WSMessage.Pong.make({ requestId: 'ping' })),
@@ -88,13 +152,19 @@ export const makeDurableObject: MakeDurableObjectClass = (options) => {
         )
 
         const colSpec = makeColumnSpec(eventlogTable.sqliteDef.ast)
-        this.env.DB.exec(`CREATE TABLE IF NOT EXISTS ${storage.dbName} (${colSpec}) strict`)
+        self.env.DB.exec(`CREATE TABLE IF NOT EXISTS ${storage.dbName} (${colSpec}) strict`)
+
+        // Create metastore table
+        const metastoreColSpec = makeColumnSpec(metastoreTable.sqliteDef.ast)
+        const metastoreDbName = `eventlog_${PERSISTENCE_FORMAT_VERSION}_serveronly`
+        self.env.DB.exec(`CREATE TABLE IF NOT EXISTS ${metastoreDbName} (${metastoreColSpec}) strict`)
 
         return new Response(null, {
           status: 101,
           webSocket: client,
         })
       }).pipe(Effect.tapCauseLogPretty, Effect.runPromise)
+    }
 
     webSocketMessage = (ws: WebSocketClient, message: ArrayBuffer | string) => {
       console.log('webSocketMessage', message)
@@ -219,6 +289,7 @@ export const makeDurableObject: MakeDurableObjectClass = (options) => {
 
               const connectedClients = this.ctx.getWebSockets()
 
+
               // console.debug(`Broadcasting push batch to ${this.subscribedWebSockets.size} clients`)
               if (connectedClients.length > 0) {
                 // TODO refactor to batch api
@@ -245,6 +316,22 @@ export const makeDurableObject: MakeDurableObjectClass = (options) => {
 
               // Wait for the storage write to complete before finishing this request
               yield* storeFiber
+
+              // Now that the write is done, let the other Durable Object know it should send new events to clients.
+              // we wrote directly to the aggregate store event log ('metastore').
+              // the clients connected to the aggregate store need to know about it. This is a different store = different durable object.
+              // instead we just make a "hey, new events came in" remote-procedure call on the durable object for the aggregate store.
+              // an alternative could be to send a copy of the events in the RPC and let the other durable object broadcast to clients similar to the above.
+              // race conditions around SQL write order vs broadcast order might complicate this.
+              const durableObjectName = 'WEBSOCKET_SERVER'
+              const durableObjectNamespace = (this.env as any)[durableObjectName] as DurableObjectNamespace
+              console.log('durableObjectNamespace', durableObjectNamespace)
+
+              const globalDurableObjectId = durableObjectNamespace.idFromName('serveronly')
+              const globalDurableObject = durableObjectNamespace.get(globalDurableObjectId)
+              // my understanding of Effect is this waits for the promise. The origin part of the url here is irrelevant but required.
+              // I think cloudflare has a new rpc syntax for that, but I don't want to deal with it.
+              yield* Effect.promise(() => globalDurableObject.fetch('https://localhost:9876/hack'))
 
               break
             }
@@ -305,6 +392,7 @@ export const makeDurableObject: MakeDurableObjectClass = (options) => {
 }
 
 type SyncStorage = {
+  execDb: <T>(cb: (db: D1Database) => Promise<D1Result<T>>) => any
   dbName: string
   // getHead: Effect.Effect<EventSequenceNumber.GlobalEventSequenceNumber, UnexpectedError>
   getEvents: (
@@ -322,6 +410,7 @@ type SyncStorage = {
 
 const makeStorage = (ctx: DurableObjectState, env: Env, storeId: string): SyncStorage => {
   const dbName = `eventlog_${PERSISTENCE_FORMAT_VERSION}_${toValidTableName(storeId)}`
+  const metastoreDbName = `eventlog_${PERSISTENCE_FORMAT_VERSION}_serveronly`
 
   const execDb = <T>(cb: (db: D1Database) => Promise<D1Result<T>>) =>
     Effect.tryPromise({
@@ -331,6 +420,37 @@ const makeStorage = (ctx: DurableObjectState, env: Env, storeId: string): SyncSt
       Effect.map((_) => _.results),
       Effect.withSpan('@livestore/sync-cf:durable-object:execDb'),
     )
+
+  const execDbBatch = (statements: D1PreparedStatement[]) =>
+    Effect.tryPromise({
+      try: async () => {
+        console.log('[execDbBatch] Executing', statements.length, 'statements against database')
+        const result = await env.DB.batch(statements)
+        console.log('[execDbBatch] Database batch completed, results:', result.map(r => ({ success: r.success, changes: r.meta?.changes })))
+        return result
+      },
+      catch: (error) => {
+        console.error('[execDbBatch] Database batch failed:', error)
+        return new UnexpectedError({ cause: error, payload: { dbName } })
+      },
+    }).pipe(
+      Effect.withSpan('@livestore/sync-cf:durable-object:execDbBatch'),
+    )
+
+  const getNextMetastoreSequences = (count: number): Effect.Effect<{sequences: number[], startParent: number}, UnexpectedError> =>
+    Effect.gen(function* () {
+      // Get current max sequence number from metastore with SELECT FOR UPDATE to prevent races
+      const result = yield* execDb<{ seqNum: number }>((db) => {
+        // inefficient query but returning null meant dealing with typing on execDb.
+        const stmt = db.prepare(`SELECT COALESCE(MAX(seqNum), ${EventSequenceNumber.ROOT.global}) as seqNum FROM ${metastoreDbName}`)
+        return stmt.all() // Use .all() instead of .first() to get D1Result
+      })
+
+      const currentMax = result[0]?.seqNum ?? EventSequenceNumber.ROOT.global
+      const sequences = Array.from({ length: count }, (_, i) => currentMax + i + 1)
+
+      return { sequences, startParent: currentMax }
+    }).pipe(UnexpectedError.mapToUnexpectedError)
 
   // const getHead: Effect.Effect<EventSequenceNumber.GlobalEventSequenceNumber, UnexpectedError> = Effect.gen(
   //   function* () {
@@ -364,22 +484,31 @@ const makeStorage = (ctx: DurableObjectState, env: Env, storeId: string): SyncSt
 
   const appendEvents: SyncStorage['appendEvents'] = (batch, createdAt) =>
     Effect.gen(function* () {
+      console.log('[appendEvents] Called with batch:', batch.length, 'events, storeId:', storeId)
       // If there are no events, do nothing.
       if (batch.length === 0) return
 
+      // Get global sequence numbers for metastore events
+      const { sequences: metastoreSequences, startParent } = yield* getNextMetastoreSequences(batch.length)
+      console.log('[appendEvents] Got metastore sequences:', metastoreSequences, 'startParent:', startParent)
+
       // CF D1 limits:
       // Maximum bound parameters per query	100, Maximum arguments per SQL function	32
-      // Thus we need to split the batch into chunks of max (100/7=)14 events each.
-      const CHUNK_SIZE = 14
+      // Since we're now writing to both room and metastore tables, we need to account for doubled parameters
+      // Room events: 7 params each, Metastore events: 8 params each (including originalStoreId)
+      // Total: 15 params per event pair, so max (100/15=)6 events per chunk
+      const CHUNK_SIZE = 6
 
       for (let i = 0; i < batch.length; i += CHUNK_SIZE) {
         const chunk = batch.slice(i, i + CHUNK_SIZE)
+        const chunkMetastoreSeqs = metastoreSequences.slice(i, i + CHUNK_SIZE)
 
-        // Create a list of placeholders ("(?, ?, ?, ?, ?, ?, ?)"), corresponding to each event.
-        const valuesPlaceholders = chunk.map(() => '(?, ?, ?, ?, ?, ?, ?)').join(', ')
-        const sql = `INSERT INTO ${dbName} (seqNum, parentSeqNum, args, name, createdAt, clientId, sessionId) VALUES ${valuesPlaceholders}`
-        // Flatten the event properties into a parameters array.
-        const params = chunk.flatMap((event) => [
+        const statements: D1PreparedStatement[] = []
+
+        // Room table insert
+        const roomValuesPlaceholders = chunk.map(() => '(?, ?, ?, ?, ?, ?, ?)').join(', ')
+        const roomSql = `INSERT INTO ${dbName} (seqNum, parentSeqNum, args, name, createdAt, clientId, sessionId) VALUES ${roomValuesPlaceholders}`
+        const roomParams = chunk.flatMap((event) => [
           event.seqNum,
           event.parentSeqNum,
           event.args === undefined ? null : JSON.stringify(event.args),
@@ -388,13 +517,31 @@ const makeStorage = (ctx: DurableObjectState, env: Env, storeId: string): SyncSt
           event.clientId,
           event.sessionId,
         ])
+        statements.push(env.DB.prepare(roomSql).bind(...roomParams))
 
-        yield* execDb((db) =>
-          db
-            .prepare(sql)
-            .bind(...params)
-            .run(),
-        )
+        // Metastore table insert
+        const metastoreValuesPlaceholders = chunk.map(() => '(?, ?, ?, ?, ?, ?, ?, ?)').join(', ')
+        const metastoreSql = `INSERT INTO ${metastoreDbName} (seqNum, parentSeqNum, args, name, createdAt, clientId, sessionId, originalStoreId) VALUES ${metastoreValuesPlaceholders}`
+        const metastoreParams = chunk.flatMap((event, idx) => [
+          chunkMetastoreSeqs[idx],
+          i === 0 && idx === 0 ? startParent : (chunkMetastoreSeqs[idx] ?? 0) - 1, // First event uses startParent, others use previous sequence
+          event.args === undefined ? null : JSON.stringify(event.args),
+          event.name,
+          createdAt,
+          event.clientId,
+          event.sessionId,
+          storeId, // originalStoreId
+        ])
+        statements.push(env.DB.prepare(metastoreSql).bind(...metastoreParams))
+
+        // Execute both inserts atomically
+        console.log('[appendEvents] Executing batch with', statements.length, 'statements:')
+        console.log('[appendEvents] Room SQL:', roomSql)
+        console.log('[appendEvents] Room params:', roomParams)
+        console.log('[appendEvents] Metastore SQL:', metastoreSql)
+        console.log('[appendEvents] Metastore params:', metastoreParams)
+        const batchResult = yield* execDbBatch(statements)
+        console.log('[appendEvents] Batch executed successfully, result:', batchResult)
       }
     }).pipe(UnexpectedError.mapToUnexpectedError)
 
@@ -405,6 +552,7 @@ const makeStorage = (ctx: DurableObjectState, env: Env, storeId: string): SyncSt
   return {
     dbName,
     // getHead,
+    execDb,
     getEvents,
     appendEvents,
     resetStore,
